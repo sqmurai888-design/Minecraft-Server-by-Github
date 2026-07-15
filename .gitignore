@@ -1,0 +1,12 @@
+# ローカルでテスト実行した場合のサーバーファイル
+server.jar
+eula.txt
+world/
+logs/
+console.out
+bore
+bore.log
+bore.tgz
+console.in
+*.json.lock
+session.lock
