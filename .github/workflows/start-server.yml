@@ -7,6 +7,14 @@ on:
         description: "Minecraftのバージョン (latest = 最新版)"
         required: false
         default: "latest"
+      server_type:
+        description: "サーバーの種類 (MODを使う場合は fabric か forge)"
+        type: choice
+        options:
+          - vanilla
+          - fabric
+          - forge
+        default: vanilla
       idle_timeout:
         description: "無人時の自動停止までの分数 (0 = 自動停止しない)"
         required: false
@@ -55,6 +63,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MC_VERSION: ${{ steps.resolve.outputs.mc_version }}
+          SERVER_TYPE: ${{ inputs.server_type }}
           SERVER_JAR_URL: ${{ steps.resolve.outputs.server_jar_url }}
           IDLE_TIMEOUT_MIN: ${{ inputs.idle_timeout }}
           BACKUP_INTERVAL_MIN: ${{ inputs.backup_interval }}

@@ -4,6 +4,7 @@ set -euo pipefail
 
 # ============================== 設定 ==============================
 MC_VERSION="${MC_VERSION:-latest}"          # Minecraft バージョン
+SERVER_TYPE="${SERVER_TYPE:-vanilla}"       # vanilla / fabric / forge
 IDLE_TIMEOUT_MIN="${IDLE_TIMEOUT_MIN:-30}"        # 無人時の自動停止 (分, 0=無効)
 BACKUP_INTERVAL_MIN="${BACKUP_INTERVAL_MIN:-20}"  # 定期バックアップ間隔 (分, 0=無効)
 AUTO_RESTART="${AUTO_RESTART:-true}"              # 6時間制限時に自動再起動するか
@@ -21,7 +22,7 @@ cd "$SERVER_DIR"
 
 log() { echo "[$(date -u '+%H:%M:%S')] $*"; }
 
-# ============================== バージョン解決 & ダウンロード ==============================
+# ============================== バージョン解決 ==============================
 # 通常はワークフローの resolve ステップ (scripts/resolve-version.sh) が
 # SERVER_JAR_URL を渡してくる。ローカル実行時のみここで解決する。
 if [ -z "${SERVER_JAR_URL:-}" ]; then
@@ -37,8 +38,6 @@ if [ -z "${SERVER_JAR_URL:-}" ]; then
   fi
   SERVER_JAR_URL=$(curl -fsSL "$VERSION_URL" | jq -r '.downloads.server.url')
 fi
-log "Minecraft $MC_VERSION のサーバーをダウンロードしています..."
-curl -fsSL -o server.jar "$SERVER_JAR_URL"
 
 # ============================== ワールドデータの復元 ==============================
 if git -C "$REPO_DIR" fetch origin "$WORLD_BRANCH" 2>/dev/null; then
@@ -58,10 +57,79 @@ if [ -f "$REPO_DIR/config/server.properties" ]; then
   cp "$REPO_DIR/config/server.properties" server.properties
 fi
 
+# MOD の配置 (リポジトリの mods/ フォルダから)
+MOD_COUNT=0
+if compgen -G "$REPO_DIR/mods/*.jar" > /dev/null; then
+  if [ "$SERVER_TYPE" = "vanilla" ]; then
+    echo "::warning::mods/ に MOD がありますが、サーバーの種類が vanilla のため読み込まれません。fabric か forge を選んでください。"
+  else
+    mkdir -p mods
+    rm -f mods/*.jar
+    cp "$REPO_DIR"/mods/*.jar mods/
+    MOD_COUNT=$(find mods -maxdepth 1 -name '*.jar' | wc -l)
+    log "MOD を ${MOD_COUNT} 個配置しました"
+  fi
+fi
+
 # メモリはランナーの搭載量から自動計算 (2.5GB をシステム用に残す)
 TOTAL_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
 XMX_MB=$(( TOTAL_MB - 2560 )); [ "$XMX_MB" -lt 2048 ] && XMX_MB=2048
 log "メモリ割り当て: ${XMX_MB}MB"
+
+# ============================== サーバー本体の準備 ==============================
+LAUNCH=()
+case "$SERVER_TYPE" in
+  vanilla)
+    log "Minecraft $MC_VERSION (バニラ) をダウンロードしています..."
+    curl -fsSL -o server.jar "$SERVER_JAR_URL"
+    LAUNCH=(java -Xms1024M -Xmx${XMX_MB}M -jar server.jar nogui)
+    ;;
+  fabric)
+    log "Fabric サーバー (Minecraft $MC_VERSION) を準備しています..."
+    LOADER_META=$(curl -fsSL "https://meta.fabricmc.net/v2/versions/loader/$MC_VERSION")
+    LOADER_VER=$(echo "$LOADER_META" | jq -r '[.[] | select(.loader.stable)][0].loader.version // .[0].loader.version // empty')
+    if [ -z "$LOADER_VER" ]; then
+      echo "::error::Minecraft $MC_VERSION に対応する Fabric がまだ提供されていません。対応バージョンは https://fabricmc.net/use/server/ で確認できます。"
+      exit 1
+    fi
+    INSTALLER_VER=$(curl -fsSL "https://meta.fabricmc.net/v2/versions/installer" | jq -r '[.[] | select(.stable)][0].version // .[0].version')
+    log "Fabric Loader $LOADER_VER をダウンロードしています..."
+    curl -fsSL -o server.jar \
+      "https://meta.fabricmc.net/v2/versions/loader/$MC_VERSION/$LOADER_VER/$INSTALLER_VER/server/jar"
+    LAUNCH=(java -Xms1024M -Xmx${XMX_MB}M -jar server.jar nogui)
+    ;;
+  forge)
+    log "Forge サーバー (Minecraft $MC_VERSION) を準備しています..."
+    PROMOS=$(curl -fsSL "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json")
+    FORGE_VER=$(echo "$PROMOS" | jq -r --arg k "$MC_VERSION-latest" '.promos[$k] // empty')
+    if [ -z "$FORGE_VER" ]; then
+      echo "::error::Minecraft $MC_VERSION に対応する Forge が見つかりません。対応バージョンは https://files.minecraftforge.net/ で確認できます。"
+      exit 1
+    fi
+    log "Forge $FORGE_VER をインストールしています (数分かかります)..."
+    curl -fsSL -o forge-installer.jar \
+      "https://maven.minecraftforge.net/net/minecraftforge/forge/$MC_VERSION-$FORGE_VER/forge-$MC_VERSION-$FORGE_VER-installer.jar"
+    if ! java -jar forge-installer.jar --installServer > forge-install.log 2>&1; then
+      echo "::error::Forge のインストールに失敗しました。ログ末尾:"
+      tail -30 forge-install.log || true
+      exit 1
+    fi
+    if [ -f run.sh ]; then
+      # 新しい Forge (1.17+): run.sh 経由で起動し、メモリは user_jvm_args.txt で指定
+      printf -- "-Xms1024M\n-Xmx%sM\n" "$XMX_MB" > user_jvm_args.txt
+      chmod +x run.sh
+      LAUNCH=(./run.sh nogui)
+    else
+      # 古い Forge: forge-*.jar を直接起動
+      FORGE_JAR=$(find . -maxdepth 1 -name "forge-*.jar" ! -name "*installer*" | head -1)
+      LAUNCH=(java -Xms1024M -Xmx${XMX_MB}M -jar "$FORGE_JAR" nogui)
+    fi
+    ;;
+  *)
+    echo "::error::不明なサーバー種類 '$SERVER_TYPE' です (vanilla / fabric / forge)。"
+    exit 1
+    ;;
+esac
 
 # ============================== サーバー起動 ==============================
 mkfifo console.in
@@ -69,7 +137,7 @@ exec 3<> console.in
 send() { echo "$1" >&3; }
 
 log "Minecraft サーバーを起動しています (初回はワールド生成に数分かかります)..."
-java -Xms1024M -Xmx${XMX_MB}M -jar server.jar nogui <&3 > console.out 2>&1 &
+"${LAUNCH[@]}" <&3 > console.out 2>&1 &
 JAVA_PID=$!
 server_running() { kill -0 "$JAVA_PID" 2>/dev/null; }
 
@@ -143,7 +211,8 @@ echo "$BIG_LINE"
   echo ""
   echo "| 項目 | 値 |"
   echo "| --- | --- |"
-  echo "| バージョン | $MC_VERSION |"
+  echo "| バージョン | $MC_VERSION ($SERVER_TYPE) |"
+  [ "$MOD_COUNT" -gt 0 ] && echo "| MOD | ${MOD_COUNT}個 |"
   echo "| 無人時の自動停止 | ${IDLE_TIMEOUT_MIN}分 |"
   echo "| ワールド保存 | ${BACKUP_INTERVAL_MIN}分ごと + 全員退出時 + 停止時 |"
   echo "| 最大稼働時間 | 約5.5時間 (その後自動保存$( [ "$AUTO_RESTART" = "true" ] && echo "・自動再起動" )) |"
@@ -173,6 +242,10 @@ backup() { # $1 = SERVER_ADDRESS.txt に書く状態文字列
   rsync -a --exclude 'session.lock' world "$bk/"
   for f in ops.json whitelist.json banned-players.json banned-ips.json usercache.json server.properties; do
     [ -f "$f" ] && cp "$f" "$bk/" || true
+  done
+  # MOD が生成する設定ディレクトリも保存 (fabric/forge)
+  for d in config defaultconfigs; do
+    [ -d "$d" ] && rsync -a "$d" "$bk/" || true
   done
   server_running && send "save-on"
   echo "$1" > "$bk/SERVER_ADDRESS.txt"
@@ -285,7 +358,7 @@ if [ "$STOP_REASON" = "timeout" ] && [ "$AUTO_RESTART" = "true" ]; then
     -H "Authorization: Bearer $GITHUB_TOKEN" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/start-server.yml/dispatches" \
-    -d "{\"ref\":\"${GITHUB_REF_NAME}\",\"inputs\":{\"minecraft_version\":\"${MC_VERSION}\",\"idle_timeout\":\"${IDLE_TIMEOUT_MIN}\",\"backup_interval\":\"${BACKUP_INTERVAL_MIN}\",\"auto_restart\":\"true\"}}" \
+    -d "{\"ref\":\"${GITHUB_REF_NAME}\",\"inputs\":{\"minecraft_version\":\"${MC_VERSION}\",\"server_type\":\"${SERVER_TYPE}\",\"idle_timeout\":\"${IDLE_TIMEOUT_MIN}\",\"backup_interval\":\"${BACKUP_INTERVAL_MIN}\",\"auto_restart\":\"true\"}}" \
     && echo "## 🔄 新しいサーバーを起動しました。最新の実行のアドレスを確認してください。" >> "$GITHUB_STEP_SUMMARY" \
     || echo "::warning::自動再起動に失敗しました。手動で Start Minecraft Server を実行してください。"
 fi
