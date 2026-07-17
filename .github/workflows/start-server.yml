@@ -11,6 +11,10 @@ on:
         description: "無人時の自動停止までの分数 (0 = 自動停止しない)"
         required: false
         default: "30"
+      backup_interval:
+        description: "自動バックアップの間隔 (分, 0 = 定期バックアップ無効)"
+        required: false
+        default: "20"
       auto_restart:
         description: "6時間制限に達したとき自動で再起動する"
         type: boolean
@@ -53,4 +57,5 @@ jobs:
           MC_VERSION: ${{ steps.resolve.outputs.mc_version }}
           SERVER_JAR_URL: ${{ steps.resolve.outputs.server_jar_url }}
           IDLE_TIMEOUT_MIN: ${{ inputs.idle_timeout }}
+          BACKUP_INTERVAL_MIN: ${{ inputs.backup_interval }}
           AUTO_RESTART: ${{ inputs.auto_restart }}

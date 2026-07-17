@@ -4,10 +4,10 @@ set -euo pipefail
 
 # ============================== 設定 ==============================
 MC_VERSION="${MC_VERSION:-latest}"          # Minecraft バージョン
-IDLE_TIMEOUT_MIN="${IDLE_TIMEOUT_MIN:-30}"  # 無人時の自動停止 (分, 0=無効)
-AUTO_RESTART="${AUTO_RESTART:-true}"        # 6時間制限時に自動再起動するか
-MAX_RUNTIME_MIN=330                         # 最大稼働時間 (GitHub の6時間制限より前に保存して止める)
-BACKUP_INTERVAL_SEC=1200                    # 自動バックアップ間隔 (20分)
+IDLE_TIMEOUT_MIN="${IDLE_TIMEOUT_MIN:-30}"        # 無人時の自動停止 (分, 0=無効)
+BACKUP_INTERVAL_MIN="${BACKUP_INTERVAL_MIN:-20}"  # 定期バックアップ間隔 (分, 0=無効)
+AUTO_RESTART="${AUTO_RESTART:-true}"              # 6時間制限時に自動再起動するか
+MAX_RUNTIME_MIN=330                               # 最大稼働時間 (GitHub の6時間制限より前に保存して止める)
 WORLD_BRANCH="world-data"                   # ワールド保存先ブランチ
 STOP_BRANCH="stop-signal"                   # 停止シグナル用ブランチ
 
@@ -145,6 +145,7 @@ echo "$BIG_LINE"
   echo "| --- | --- |"
   echo "| バージョン | $MC_VERSION |"
   echo "| 無人時の自動停止 | ${IDLE_TIMEOUT_MIN}分 |"
+  echo "| ワールド保存 | ${BACKUP_INTERVAL_MIN}分ごと + 全員退出時 + 停止時 |"
   echo "| 最大稼働時間 | 約5.5時間 (その後自動保存$( [ "$AUTO_RESTART" = "true" ] && echo "・自動再起動" )) |"
   echo ""
   echo "⚠️ アドレスは起動のたびに変わります。停止するには **🔴 Stop Minecraft Server** ワークフローを実行してください。"
@@ -190,9 +191,10 @@ backup "🟢 オンライン: $ADDRESS ($(date -u '+%Y-%m-%d %H:%M UTC') 起動)
 START_TS=$(date +%s)
 LAST_ACTIVE=$START_TS
 LAST_BACKUP=$START_TS
+PREV_ONLINE=0
 STOP_REASON=""
 
-log "監視ループを開始します (停止: Stop ワークフロー / 無人${IDLE_TIMEOUT_MIN}分 / 最大${MAX_RUNTIME_MIN}分)"
+log "監視ループを開始します (停止: Stop ワークフロー / 無人${IDLE_TIMEOUT_MIN}分 / 定期バックアップ${BACKUP_INTERVAL_MIN}分ごと / 最大${MAX_RUNTIME_MIN}分)"
 while true; do
   sleep 30
   NOW=$(date +%s)
@@ -221,6 +223,14 @@ while true; do
   ONLINE=$(( JOINS - LEAVES ))
   if [ "$ONLINE" -gt 0 ]; then LAST_ACTIVE=$NOW; fi
 
+  # 全員が退出した瞬間に即バックアップ (プレイ内容を確実に残す)
+  if [ "$PREV_ONLINE" -gt 0 ] && [ "$ONLINE" -le 0 ]; then
+    log "全プレイヤーが退出しました。ワールドを保存します..."
+    backup "🟢 オンライン: $ADDRESS ($(date -u '+%Y-%m-%d %H:%M UTC') 全員退出時に保存)"
+    LAST_BACKUP=$NOW
+  fi
+  PREV_ONLINE=$ONLINE
+
   if [ "$IDLE_TIMEOUT_MIN" -gt 0 ] && [ $(( NOW - LAST_ACTIVE )) -gt $(( IDLE_TIMEOUT_MIN * 60 )) ]; then
     STOP_REASON="idle"; break
   fi
@@ -230,7 +240,7 @@ while true; do
   if [ $(( NOW - START_TS )) -gt $(( MAX_RUNTIME_MIN * 60 )) ]; then
     STOP_REASON="timeout"; break
   fi
-  if [ $(( NOW - LAST_BACKUP )) -gt "$BACKUP_INTERVAL_SEC" ]; then
+  if [ "$BACKUP_INTERVAL_MIN" -gt 0 ] && [ $(( NOW - LAST_BACKUP )) -gt $(( BACKUP_INTERVAL_MIN * 60 )) ]; then
     backup "🟢 オンライン: $ADDRESS ($(date -u '+%Y-%m-%d %H:%M UTC') 時点)"
     LAST_BACKUP=$NOW
   fi
@@ -275,7 +285,7 @@ if [ "$STOP_REASON" = "timeout" ] && [ "$AUTO_RESTART" = "true" ]; then
     -H "Authorization: Bearer $GITHUB_TOKEN" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/start-server.yml/dispatches" \
-    -d "{\"ref\":\"${GITHUB_REF_NAME}\",\"inputs\":{\"minecraft_version\":\"${MC_VERSION}\",\"idle_timeout\":\"${IDLE_TIMEOUT_MIN}\",\"auto_restart\":\"true\"}}" \
+    -d "{\"ref\":\"${GITHUB_REF_NAME}\",\"inputs\":{\"minecraft_version\":\"${MC_VERSION}\",\"idle_timeout\":\"${IDLE_TIMEOUT_MIN}\",\"backup_interval\":\"${BACKUP_INTERVAL_MIN}\",\"auto_restart\":\"true\"}}" \
     && echo "## 🔄 新しいサーバーを起動しました。最新の実行のアドレスを確認してください。" >> "$GITHUB_STEP_SUMMARY" \
     || echo "::warning::自動再起動に失敗しました。手動で Start Minecraft Server を実行してください。"
 fi
