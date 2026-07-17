@@ -32,18 +32,25 @@ jobs:
       actions: write
     steps:
       - name: リポジトリを取得
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Java 21 をセットアップ
-        uses: actions/setup-java@v4
+      - name: バージョンと必要な Java を解決
+        id: resolve
+        run: bash scripts/resolve-version.sh
+        env:
+          MC_VERSION: ${{ inputs.minecraft_version }}
+
+      - name: Java ${{ steps.resolve.outputs.java_version }} をセットアップ
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: ${{ steps.resolve.outputs.java_version }}
 
       - name: サーバーを起動
         run: bash scripts/server.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MC_VERSION: ${{ inputs.minecraft_version }}
+          MC_VERSION: ${{ steps.resolve.outputs.mc_version }}
+          SERVER_JAR_URL: ${{ steps.resolve.outputs.server_jar_url }}
           IDLE_TIMEOUT_MIN: ${{ inputs.idle_timeout }}
           AUTO_RESTART: ${{ inputs.auto_restart }}

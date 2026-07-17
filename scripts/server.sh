@@ -22,17 +22,21 @@ cd "$SERVER_DIR"
 log() { echo "[$(date -u '+%H:%M:%S')] $*"; }
 
 # ============================== バージョン解決 & ダウンロード ==============================
-log "Minecraft バージョンを解決しています..."
-MANIFEST=$(curl -fsSL "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
-if [ "$MC_VERSION" = "latest" ] || [ -z "$MC_VERSION" ]; then
-  MC_VERSION=$(echo "$MANIFEST" | jq -r '.latest.release')
+# 通常はワークフローの resolve ステップ (scripts/resolve-version.sh) が
+# SERVER_JAR_URL を渡してくる。ローカル実行時のみここで解決する。
+if [ -z "${SERVER_JAR_URL:-}" ]; then
+  log "Minecraft バージョンを解決しています..."
+  MANIFEST=$(curl -fsSL "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+  if [ "$MC_VERSION" = "latest" ] || [ -z "$MC_VERSION" ]; then
+    MC_VERSION=$(echo "$MANIFEST" | jq -r '.latest.release')
+  fi
+  VERSION_URL=$(echo "$MANIFEST" | jq -r --arg v "$MC_VERSION" '.versions[] | select(.id == $v) | .url')
+  if [ -z "$VERSION_URL" ] || [ "$VERSION_URL" = "null" ]; then
+    echo "::error::バージョン '$MC_VERSION' が見つかりません。'latest' か正しいバージョン (例: 1.21.4) を指定してください。"
+    exit 1
+  fi
+  SERVER_JAR_URL=$(curl -fsSL "$VERSION_URL" | jq -r '.downloads.server.url')
 fi
-VERSION_URL=$(echo "$MANIFEST" | jq -r --arg v "$MC_VERSION" '.versions[] | select(.id == $v) | .url')
-if [ -z "$VERSION_URL" ] || [ "$VERSION_URL" = "null" ]; then
-  echo "::error::バージョン '$MC_VERSION' が見つかりません。'latest' か正しいバージョン (例: 1.21.4) を指定してください。"
-  exit 1
-fi
-SERVER_JAR_URL=$(curl -fsSL "$VERSION_URL" | jq -r '.downloads.server.url')
 log "Minecraft $MC_VERSION のサーバーをダウンロードしています..."
 curl -fsSL -o server.jar "$SERVER_JAR_URL"
 
