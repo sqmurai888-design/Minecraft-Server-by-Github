@@ -92,10 +92,11 @@ log "サーバー起動完了!"
 
 # OP 権限の付与 (config/ops.txt に書かれたプレイヤー)
 if [ -f "$REPO_DIR/config/ops.txt" ]; then
-  grep -vE '^\s*(#|$)' "$REPO_DIR/config/ops.txt" | while read -r name; do
+  while read -r name; do
+    [ -n "$name" ] || continue
     log "OP 権限を付与: $name"
     send "op $name"
-  done
+  done < <(grep -vE '^[[:space:]]*(#|$)' "$REPO_DIR/config/ops.txt" || true)
 fi
 
 # ============================== トンネル (bore.pub) で公開 ==============================
