@@ -57,17 +57,46 @@ if [ -f "$REPO_DIR/config/server.properties" ]; then
   cp "$REPO_DIR/config/server.properties" server.properties
 fi
 
-# MOD の配置 (リポジトリの mods/ フォルダから)
+# ============================== MOD の配置 ==============================
+# 種類が合わない・壊れている MOD はスキップするだけで、サーバーの起動は妨げない
 MOD_COUNT=0
+SKIPPED_MODS=()
+MODID_MAP="$SERVER_DIR/.modid_map"
+: > "$MODID_MAP"
+
+mod_loader_type() { # jar 内のメタデータから fabric / forge / unknown を判定
+  if unzip -l "$1" 2>/dev/null | grep -q 'fabric\.mod\.json'; then echo fabric
+  elif unzip -l "$1" 2>/dev/null | grep -qE 'META-INF/(neoforge\.)?mods\.toml|mcmod\.info'; then echo forge
+  else echo unknown; fi
+}
+
+mod_id_of() { # jar から modid を取得 (取れなければ空)
+  case "$(mod_loader_type "$1")" in
+    fabric) unzip -p "$1" fabric.mod.json 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true ;;
+    forge)  unzip -p "$1" 'META-INF/*mods.toml' 2>/dev/null | grep -m1 -oE 'modId[[:space:]]*=[[:space:]]*"[^"]+"' | sed 's/.*"\(.*\)"/\1/' || true ;;
+  esac
+}
+
 if compgen -G "$REPO_DIR/mods/*.jar" > /dev/null; then
   if [ "$SERVER_TYPE" = "vanilla" ]; then
     echo "::warning::mods/ に MOD がありますが、サーバーの種類が vanilla のため読み込まれません。fabric か forge を選んでください。"
   else
     mkdir -p mods
     rm -f mods/*.jar
-    cp "$REPO_DIR"/mods/*.jar mods/
+    for jar in "$REPO_DIR"/mods/*.jar; do
+      name=$(basename "$jar")
+      ltype=$(mod_loader_type "$jar")
+      if [ "$ltype" != "unknown" ] && [ "$ltype" != "$SERVER_TYPE" ]; then
+        SKIPPED_MODS+=("$name — ${ltype} 用のため読み込みませんでした")
+        echo "::warning::MOD をスキップ: $name は ${ltype} 用です (サーバーの種類: $SERVER_TYPE)"
+        continue
+      fi
+      cp "$jar" mods/
+      id=$(mod_id_of "$jar")
+      [ -n "$id" ] && echo "$id $name" >> "$MODID_MAP"
+    done
     MOD_COUNT=$(find mods -maxdepth 1 -name '*.jar' | wc -l)
-    log "MOD を ${MOD_COUNT} 個配置しました"
+    log "MOD を ${MOD_COUNT} 個配置しました (スキップ: ${#SKIPPED_MODS[@]} 個)"
   fi
 fi
 
@@ -135,27 +164,68 @@ esac
 mkfifo console.in
 exec 3<> console.in
 send() { echo "$1" >&3; }
-
-log "Minecraft サーバーを起動しています (初回はワールド生成に数分かかります)..."
-"${LAUNCH[@]}" <&3 > console.out 2>&1 &
-JAVA_PID=$!
 server_running() { kill -0 "$JAVA_PID" 2>/dev/null; }
 
-READY=0
-for _ in $(seq 1 120); do
-  if ! server_running; then
-    echo "::error::サーバーの起動に失敗しました。ログ末尾:"
+start_attempt() { # 0=起動成功 / 1=プロセスが起動前に終了 / 2=タイムアウト
+  rm -f logs/latest.log console.out
+  "${LAUNCH[@]}" <&3 > console.out 2>&1 &
+  JAVA_PID=$!
+  for _ in $(seq 1 120); do
+    server_running || return 1
+    grep -q 'Done (' logs/latest.log 2>/dev/null && return 0
+    sleep 5
+  done
+  return 2
+}
+
+remove_incompatible_mods() { # 起動ログから原因の MOD を特定して無効化。0=特定できた / 1=特定できず
+  local ids id file removed=1
+  ids=$( { grep -ahoE "Mod '[^']+' \([A-Za-z0-9_.-]+\)" console.out logs/latest.log 2>/dev/null \
+            | grep -oE '\([A-Za-z0-9_.-]+\)' | tr -d '()';
+           grep -ahoE "Mod ID: '[A-Za-z0-9_.-]+'" console.out logs/latest.log 2>/dev/null \
+            | grep -oE "'[A-Za-z0-9_.-]+'" | tr -d "'"; } | sort -u || true)
+  for id in $ids; do
+    file=$(awk -v id="$id" '$1==id {print $2; exit}' "$MODID_MAP" || true)
+    if [ -n "$file" ] && [ -f "mods/$file" ]; then
+      rm -f "mods/$file"
+      SKIPPED_MODS+=("$file — このバージョン/構成と互換性がないため無効化しました")
+      echo "::warning::互換性のない MOD を無効化して再起動します: $file"
+      removed=0
+    fi
+  done
+  return $removed
+}
+
+log "Minecraft サーバーを起動しています (初回はワールド生成に数分かかります)..."
+ATTEMPT=1
+while true; do
+  RC=0; start_attempt || RC=$?
+  if [ "$RC" -eq 0 ]; then break; fi
+  if [ "$RC" -eq 2 ]; then
+    echo "::error::サーバーが10分以内に起動しませんでした。"
     tail -50 console.out || true
     exit 1
   fi
-  if grep -q 'Done (' logs/latest.log 2>/dev/null; then READY=1; break; fi
-  sleep 5
-done
-if [ "$READY" != "1" ]; then
-  echo "::error::サーバーが10分以内に起動しませんでした。"
+  # 起動前にプロセスが終了 → MOD が原因なら外して再試行 (ワールドには必ず入れるようにする)
+  ACTIVE_MODS=$(find mods -maxdepth 1 -name '*.jar' 2>/dev/null | wc -l)
+  if [ "$SERVER_TYPE" != "vanilla" ] && [ "$ACTIVE_MODS" -gt 0 ] && [ "$ATTEMPT" -lt 3 ]; then
+    log "起動に失敗しました。原因の MOD を調べています..."
+    if ! remove_incompatible_mods; then
+      log "原因の MOD を特定できなかったため、すべての MOD を無効化して起動します。"
+      echo "::warning::起動失敗の原因を特定できなかったため、すべての MOD を無効化して起動します。"
+      for f in mods/*.jar; do
+        [ -f "$f" ] && SKIPPED_MODS+=("$(basename "$f") — 起動失敗のため無効化しました")
+      done
+      rm -f mods/*.jar
+    fi
+    ATTEMPT=$(( ATTEMPT + 1 ))
+    continue
+  fi
+  echo "::error::サーバーの起動に失敗しました。ログ末尾:"
   tail -50 console.out || true
   exit 1
-fi
+done
+MOD_COUNT=$(find mods -maxdepth 1 -name '*.jar' 2>/dev/null | wc -l)
 log "サーバー起動完了!"
 
 # OP 権限の付与 (config/ops.txt に書かれたプレイヤー)
@@ -212,12 +282,19 @@ echo "$BIG_LINE"
   echo "| 項目 | 値 |"
   echo "| --- | --- |"
   echo "| バージョン | $MC_VERSION ($SERVER_TYPE) |"
-  [ "$MOD_COUNT" -gt 0 ] && echo "| MOD | ${MOD_COUNT}個 |"
+  if [ "$MOD_COUNT" -gt 0 ] || [ "${#SKIPPED_MODS[@]}" -gt 0 ]; then
+    echo "| MOD | 有効 ${MOD_COUNT}個 / 無効 ${#SKIPPED_MODS[@]}個 |"
+  fi
   echo "| 無人時の自動停止 | ${IDLE_TIMEOUT_MIN}分 |"
   echo "| ワールド保存 | ${BACKUP_INTERVAL_MIN}分ごと + 全員退出時 + 停止時 |"
   echo "| 最大稼働時間 | 約5.5時間 (その後自動保存$( [ "$AUTO_RESTART" = "true" ] && echo "・自動再起動" )) |"
   echo ""
   echo "⚠️ アドレスは起動のたびに変わります。停止するには **🔴 Stop Minecraft Server** ワークフローを実行してください。"
+  if [ "${#SKIPPED_MODS[@]}" -gt 0 ]; then
+    echo ""
+    echo "### ⚠️ 読み込まれなかった MOD (サーバーは MOD なしの部分も含めて起動しています)"
+    for m in "${SKIPPED_MODS[@]}"; do echo "- $m"; done
+  fi
 } >> "$GITHUB_STEP_SUMMARY"
 
 # ============================== バックアップ ==============================
