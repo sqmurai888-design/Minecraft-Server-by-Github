@@ -17,7 +17,7 @@ SERVER_DIR="${RUNNER_TEMP:-/tmp}/minecraft"
 REMOTE="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 GIT_ID=(-c user.name=minecraft-server-bot -c user.email=actions@github.com)
 
-mkdir -p "$SERVER_DIR"
+mkdir -p "$SERVER_DIR" "$SERVER_DIR/mods"
 cd "$SERVER_DIR"
 
 log() { echo "[$(date -u '+%H:%M:%S')] $*"; }
@@ -207,7 +207,7 @@ while true; do
     exit 1
   fi
   # 起動前にプロセスが終了 → MOD が原因なら外して再試行 (ワールドには必ず入れるようにする)
-  ACTIVE_MODS=$(find mods -maxdepth 1 -name '*.jar' 2>/dev/null | wc -l)
+  ACTIVE_MODS=$(find mods -maxdepth 1 -name '*.jar' 2>/dev/null | wc -l || true)
   if [ "$SERVER_TYPE" != "vanilla" ] && [ "$ACTIVE_MODS" -gt 0 ] && [ "$ATTEMPT" -lt 3 ]; then
     log "起動に失敗しました。原因の MOD を調べています..."
     if ! remove_incompatible_mods; then
@@ -225,7 +225,7 @@ while true; do
   tail -50 console.out || true
   exit 1
 done
-MOD_COUNT=$(find mods -maxdepth 1 -name '*.jar' 2>/dev/null | wc -l)
+MOD_COUNT=$(find mods -maxdepth 1 -name '*.jar' 2>/dev/null | wc -l || true)
 log "サーバー起動完了!"
 
 # OP 権限の付与 (config/ops.txt に書かれたプレイヤー)
